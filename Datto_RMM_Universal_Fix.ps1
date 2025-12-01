@@ -112,10 +112,14 @@ if ([string]::IsNullOrWhiteSpace($DomainName)) {
     $DomainName = "WORKGROUP" 
 }
 
+# Create log filename
 $LogFile = Join-Path $LogDirectory "${DomainName}_${env:COMPUTERNAME}_${TimeStamp}.log"
 
 Start-Transcript -Path $LogFile -Force
-Write-Host "===== Datto RMM Universal Fix v2.0.9 starting at $(Get-Date) on $env:COMPUTERNAME (Domain/Tenant: $DomainName) ====="
+Write-Host "===== Datto RMM Universal Fix v2.0.9 starting at $(Get-Date) on $env:COMPUTERNAME ====="
+if (![string]::IsNullOrWhiteSpace($DomainName)) {
+    Write-Host "Domain/Tenant: $DomainName"
+}
 if ([string]::IsNullOrWhiteSpace($LambdaUrl)) {
     Write-Host "S3 logging: Disabled (no Lambda URL provided)"
 } else {
@@ -255,8 +259,21 @@ if (-not $ServiceRestartFixedIssue) {
 }
 
 Write-Host "Script execution complete."
+Write-Host ""
+Write-Host "========================================="
+Write-Host "REMEDIATION SUMMARY"
+Write-Host "========================================="
 Write-Host "ServiceRestartFixedIssue = $ServiceRestartFixedIssue"
 Write-Host "RemediationPerformed = $RemediationPerformed"
+Write-Host ""
+if ($RemediationPerformed) {
+    Write-Host "ACTION TAKEN: FULL REMEDIATION (Agent reinstalled)"
+} elseif ($ServiceRestartFixedIssue) {
+    Write-Host "ACTION TAKEN: SERVICE RESTART (Service restarted successfully)"
+} else {
+    Write-Host "ACTION TAKEN: NONE (Service was already running, no issues detected)"
+}
+Write-Host "========================================="
 Stop-Transcript
 
 # Upload to S3 with folder structure

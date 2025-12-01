@@ -1,11 +1,6 @@
-# Datto_RMM_Universal_Fix.ps1
-# Version: 2.0.8
-# Last Modified: 2025-12-01
-# GitHub: https://github.com/jmyersctms/datto-rmm-remediation
-
 <#
 .SYNOPSIS
-    Universal Datto RMM agent remediation script.
+    Datto RMM Agent Universal Fix Script
 
 .DESCRIPTION
     Monitors and remediates Datto RMM agent (CagService) failures automatically.
@@ -39,6 +34,7 @@
     .\Datto_RMM_Universal_Fix.ps1
 
 .NOTES
+    Version: 2.0.9
     Requires: PowerShell 5.1+, Windows 10/11, Datto RMM agent installed
     Logs: C:\ProgramData\Datto_RMM_Logs\
 #>
@@ -63,6 +59,7 @@ $FailureEventIds = 7000,7001,7009,7031,7034
 $FailureLookbackHours = 24
 $ServiceRestartFixedIssue = $false
 $RemediationPerformed = $false
+$GlobalSiteUid = $null
 
 # Ensure log directory exists
 if (-not (Test-Path $LogDirectory)) { 
@@ -71,128 +68,239 @@ if (-not (Test-Path $LogDirectory)) {
 
 $TimeStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 
-# Get domain name for log filename
-$DomainName = try { 
+# Get domain name or Azure AD tenant for log filename
+$DomainName = try {
+    # First try traditional AD domain
     if ($env:USERDNSDOMAIN) {
         $env:USERDNSDOMAIN
-    } else {
-        # Try to get domain from WMI
-        $cs = Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue
-        if ($cs.Domain -and $cs.Domain -ne "WORKGROUP" -and $cs.Domain -notlike "*.*") {
-            # Single label domain, likely Azure AD - try dsregcmd
-            $dsregcmd = dsregcmd /status
-            $tenantName = ($dsregcmd | Select-String "TenantName").ToString().Split(":")[1].Trim()
-            if ($tenantName) {
-                $tenantName
-            } else {
-                $cs.Domain
+    }
+    else {
+        # Try Azure AD / Entra ID detection
+        try {
+            $dsregOutput = dsregcmd /status 2>&1
+            
+            # Look for TenantName line
+            $tenantLine = $dsregOutput | Where-Object { $_ -match '^\s*TenantName\s*:' }
+            
+            if ($tenantLine) {
+                $tenantName = ($tenantLine -split ':', 2)[1].Trim()
+                
+                # Clean up tenant name - remove spaces and special chars for filename safety
+                $tenantName = $tenantName -replace '[^\w\-\.]', '_'
+                
+                if (![string]::IsNullOrWhiteSpace($tenantName)) {
+                    $tenantName
+                }
+                else {
+                    "WORKGROUP"
+                }
             }
-        } elseif ($cs.Domain -and $cs.Domain -ne "WORKGROUP") {
-            $cs.Domain
-        } else {
+            else {
+                "WORKGROUP"
+            }
+        }
+        catch {
             "WORKGROUP"
         }
     }
-} catch { 
-    "WORKGROUP" 
 }
-if ([string]::IsNullOrWhiteSpace($DomainName)) { $DomainName = "WORKGROUP" }
+catch {
+    "WORKGROUP"
+}
 
-$LogFile = Join-Path $LogDirectory "${DomainName}_${env:COMPUTERNAME}_$TimeStamp.log"
+if ([string]::IsNullOrWhiteSpace($DomainName)) { 
+    $DomainName = "WORKGROUP" 
+}
+
+$LogFile = Join-Path $LogDirectory "${DomainName}_${env:COMPUTERNAME}_${TimeStamp}.log"
 
 Start-Transcript -Path $LogFile -Force
-Write-Host "===== Datto RMM Universal Fix v2.0.8 starting at $(Get-Date) on $env:COMPUTERNAME (Domain: $DomainName) ====="
+Write-Host "===== Datto RMM Universal Fix v2.0.9 starting at $(Get-Date) on $env:COMPUTERNAME (Domain/Tenant: $DomainName) ====="
 if ([string]::IsNullOrWhiteSpace($LambdaUrl)) {
     Write-Host "S3 logging: Disabled (no Lambda URL provided)"
 } else {
     Write-Host "S3 logging: Enabled"
 }
 
+# Try to read siteUID early
+if (Test-Path $SettingsJson) {
+    try {
+        $settings = Get-Content $SettingsJson -Raw | ConvertFrom-Json
+        $GlobalSiteUid = $settings.siteUID
+        if (-not [string]::IsNullOrWhiteSpace($GlobalSiteUid)) {
+            Write-Host "Detected siteUID: $GlobalSiteUid"
+        }
+    } catch {
+        Write-Warning "Early siteUID read failed: $($_.Exception.Message)"
+    }
+}
+
 Write-Host "Waiting 5 minutes for system stabilization..."
 Start-Sleep -Seconds 300
 
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($svc) { Write-Host "Initial CagService status: $($svc.Status)" }
+if ($svc) { 
+    Write-Host "Initial CagService status: $($svc.Status)" 
+}
 
+# Service Restart Logic
 if ($svc -and $svc.Status -eq 'Stopped') {
     Write-Host "CagService stopped. Attempting restart..."
     Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
     
-    $maxWait = 90; $interval = 5; $elapsed = 0
+    $maxWait = 90
+    $interval = 5
+    $elapsed = 0
+    
     while ($elapsed -lt $maxWait) {
         Start-Sleep -Seconds $interval
         $elapsed += $interval
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        
         if ($svc -and $svc.Status -eq 'Running') {
             Write-Host "Service restart succeeded after $elapsed seconds."
             $ServiceRestartFixedIssue = $true
             break
         }
     }
+    
+    if (-not $ServiceRestartFixedIssue) {
+        Write-Warning "Service restart failed or timed out after $maxWait seconds."
+    }
 }
 
+# Event Log Check
 if (-not $ServiceRestartFixedIssue) {
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    $ServiceUnhealthy = (-not $svc -or $svc.Status -ne 'Running')
-
-    if ($ServiceUnhealthy) {
-        $HasFailureEvents = $false
+    Write-Host "Checking event log for CagService failures in the last $FailureLookbackHours hours..."
+    
+    $lookbackTime = (Get-Date).AddHours(-$FailureLookbackHours)
+    $failureEvents = Get-WinEvent -FilterHashtable @{
+        LogName = 'System'
+        ID = $FailureEventIds
+        StartTime = $lookbackTime
+    } -ErrorAction SilentlyContinue | Where-Object { $_.Message -like "*$ServiceName*" }
+    
+    if ($failureEvents) {
+        Write-Host "Found $($failureEvents.Count) CagService failure event(s). Proceeding with full remediation."
+        
+        # Full Remediation Logic
         try {
-            $events = Get-WinEvent -FilterHashtable @{
-                LogName = 'System'; Id = $FailureEventIds
-                StartTime = (Get-Date).AddHours(-$FailureLookbackHours)
-            } -ErrorAction SilentlyContinue
-            if ($events) {
-                $relevant = $events | Where-Object { $_.Message -match 'CagService|Datto RMM' }
-                if ($relevant) { $HasFailureEvents = $true }
+            # Stop service
+            Write-Host "Stopping CagService..."
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            
+            # Rename old agent directory
+            if (Test-Path $AgentDir) {
+                $backupName = "CentraStage.OLD_$TimeStamp"
+                $backupPath = Join-Path (Split-Path $AgentDir -Parent) $backupName
+                Write-Host "Renaming $AgentDir to $backupName..."
+                Rename-Item -Path $AgentDir -NewName $backupName -Force
             }
-        } catch {}
-
-        if ($HasFailureEvents -and (Test-Path $SettingsJson)) {
-            try {
-                $settings = Get-Content $SettingsJson -Raw | ConvertFrom-Json
-                $siteUID = $settings.siteUID
-                if ($siteUID) {
-                    $InstallerUrl = "https://$Platform.rmm.datto.com/download-agent/windows/$siteUID"
-                    if ($svc) { Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 5 }
-                    if (Test-Path $AgentDir) { Rename-Item -Path $AgentDir -NewName "$AgentDir.OLD_$TimeStamp" -Force -ErrorAction SilentlyContinue }
-                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                    $TempExe = Join-Path $env:TEMP "DattoAgent_$siteUID_$TimeStamp.exe"
-                    Invoke-WebRequest -Uri $InstallerUrl -OutFile $TempExe -UseBasicParsing -ErrorAction Stop
-                    Start-Process -FilePath $TempExe -ArgumentList "/S" -Wait -PassThru | Out-Null
-                    Remove-Item -Path $TempExe -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 30
-                    $RemediationPerformed = $true
+            
+            # Read siteUID from backed up Settings.json
+            $siteUID = $null
+            $backupSettingsJson = Join-Path $backupPath "AEMAgent\Settings.json"
+            
+            if (Test-Path $backupSettingsJson) {
+                try {
+                    $settings = Get-Content $backupSettingsJson -Raw | ConvertFrom-Json
+                    $siteUID = $settings.siteUID
+                    Write-Host "Retrieved siteUID from backup: $siteUID"
+                } catch {
+                    Write-Warning "Could not read siteUID from backup: $($_.Exception.Message)"
                 }
-            } catch {}
+            }
+            
+            if ([string]::IsNullOrWhiteSpace($siteUID)) {
+                Write-Error "Could not retrieve siteUID. Cannot download installer."
+                throw "Missing siteUID"
+            }
+            
+            # Download installer
+            $installerUrl = "https://$Platform.centrastage.net/csm/profile/downloadAgent/$siteUID"
+            $installerPath = Join-Path $env:TEMP "DattoRMMInstaller_$TimeStamp.exe"
+            
+            Write-Host "Downloading installer from: $installerUrl"
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing -TimeoutSec 300
+            
+            if (-not (Test-Path $installerPath)) {
+                throw "Installer download failed"
+            }
+            
+            Write-Host "Installer downloaded successfully: $installerPath"
+            
+            # Install agent
+            Write-Host "Installing Datto RMM agent silently..."
+            $installProcess = Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait -PassThru -NoNewWindow
+            
+            if ($installProcess.ExitCode -eq 0) {
+                Write-Host "Agent installation completed successfully."
+                $RemediationPerformed = $true
+            } else {
+                Write-Warning "Agent installation returned exit code: $($installProcess.ExitCode)"
+            }
+            
+            # Cleanup installer
+            Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+            
+        } catch {
+            Write-Error "Full remediation failed: $($_.Exception.Message)"
         }
+        
+    } else {
+        Write-Host "No CagService failure events found in the last $FailureLookbackHours hours."
     }
 }
 
 Write-Host "Script execution complete."
+Write-Host "ServiceRestartFixedIssue = $ServiceRestartFixedIssue"
+Write-Host "RemediationPerformed = $RemediationPerformed"
 Stop-Transcript
 
-# Upload with simple folder structure and domain in filename
+# Upload to S3 with folder structure
 if (($ServiceRestartFixedIssue -or $RemediationPerformed) -and -not [string]::IsNullOrWhiteSpace($LambdaUrl)) {
     Start-Sleep -Seconds 1
+    
     try {
-        $mode = if ($ServiceRestartFixedIssue) { 'restart' } else { 'remediation' }
-        $prefix = if ($ServiceRestartFixedIssue) { 'ServiceRestartFix/' } else { 'FullRemediation/' }
+        $mode = 'noaction'
+        $prefix = $null
         
-        # Build S3 filename: DOMAIN_HOSTNAME_TIMESTAMP.log (same as local)
-        $s3FileName = "${DomainName}_${env:COMPUTERNAME}_${TimeStamp}.log"
+        if ($ServiceRestartFixedIssue) {
+            $mode = 'restart'
+            $prefix = "ServiceRestartFix/"
+        }
+        elseif ($RemediationPerformed) {
+            $mode = 'remediation'
+            $prefix = "FullRemediation/"
+        }
         
-        $body = [IO.File]::ReadAllText($LogFile)
-        
-        $uri = "{0}?device={1}&mode={2}&prefix={3}&domain={4}&s3filename={5}&ts={6}" -f `
-               $LambdaUrl,
-               [Uri]::EscapeDataString($env:COMPUTERNAME),
-               [Uri]::EscapeDataString($mode),
-               [Uri]::EscapeDataString($prefix),
-               [Uri]::EscapeDataString($DomainName),
-               [Uri]::EscapeDataString($s3FileName),
-               [Uri]::EscapeDataString($TimeStamp)
-        
-        Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'text/plain' -TimeoutSec 15 -ErrorAction Stop | Out-Null
-    } catch {}
+        if ($mode -ne 'noaction') {
+            $fileName = Split-Path $LogFile -Leaf
+            $body = [IO.File]::ReadAllText($LogFile)
+            
+            # Build query string with all parameters
+            $queryParams = @(
+                "device=$([Uri]::EscapeDataString($env:COMPUTERNAME))"
+                "mode=$([Uri]::EscapeDataString($mode))"
+                "prefix=$([Uri]::EscapeDataString($prefix))"
+                "domain=$([Uri]::EscapeDataString($DomainName))"
+                "s3filename=$([Uri]::EscapeDataString($fileName))"
+                "ts=$([Uri]::EscapeDataString($TimeStamp))"
+            )
+            
+            if ($GlobalSiteUid) {
+                $queryParams += "siteuid=$([Uri]::EscapeDataString($GlobalSiteUid))"
+            }
+            
+            $uri = "{0}?{1}" -f $LambdaUrl.TrimEnd('/'), ($queryParams -join '&')
+            
+            Write-Host "Uploading log to S3..."
+            Invoke-RestMethod -Uri $uri -Method Post -Body $body -ContentType 'text/plain' -TimeoutSec 15 -ErrorAction Stop | Out-Null
+            Write-Host "Log uploaded successfully."
+        }
+    } catch {
+        Write-Warning "Failed to upload log to S3: $($_.Exception.Message)"
+    }
 }

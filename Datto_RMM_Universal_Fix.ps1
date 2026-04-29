@@ -1,4 +1,8 @@
 <#
+
+.FIX (Leproide) 
+Replace goto with do while
+
 .SYNOPSIS
     Datto RMM Agent Universal Fix Script
 
@@ -537,12 +541,13 @@ Start-Sleep -Seconds $StabilizationSeconds
 # =========================
 # Core logic
 # =========================
+do {
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if (-not $svc) {
     Write-ErrorLine "Service '$ServiceName' not found."
     Write-DecisionLine "Exiting because required service is missing."
     $FinalServiceStatus = "NotFound"
-    goto Done
+    break
 }
 
 $svc.Refresh()
@@ -553,7 +558,7 @@ Write-LogLine "Initial $ServiceName status: $($svc.Status)"
 if ($svc.Status -eq 'Running') {
     Write-DecisionLine "$ServiceName is Running. No remediation path entered (historical events intentionally ignored)."
     $FinalServiceStatus = "Running"
-    goto Done
+    break
 }
 
 # Service is NOT running -> attempt start
@@ -589,7 +594,7 @@ if ($startSucceeded) {
     }
     Invoke-LambdaUpload -Mode "restart" -DomainName $DomainName -DeviceName $DeviceName -UuidFolder $siteUid -LogPath $LogPath
 
-    goto Done
+    break
 }
 
 Write-WarnLine "Start attempt did not result in Running state."
@@ -606,7 +611,7 @@ if (-not $failEvents -or $failEvents.Count -eq 0) {
     Write-LogLine "No qualifying $ServiceName failure events found in the last $EventLookbackHours hour(s)."
     Write-DecisionLine "Skipping full remediation: service is not running but no corroborating failure event was found."
     $FinalServiceStatus = "$($svc.Status)"
-    goto Done
+    break
 }
 
 Write-LogLine "Found $($failEvents.Count) qualifying failure event(s)."
@@ -622,7 +627,7 @@ foreach ($evt in ($failEvents | Select-Object -First 3)) {
 if (-not $RemediateEnabled) {
     Write-DecisionLine "Remediation disabled by configuration (REMEDIATE_ENABLED=FALSE). Reinstall path skipped."
     $FinalServiceStatus = "$($svc.Status)"
-    goto Done
+    break
 }
 
 if ($StartupGraceMinutes -gt 0) {
@@ -632,7 +637,7 @@ if ($StartupGraceMinutes -gt 0) {
         if ($uptime.TotalMinutes -lt $StartupGraceMinutes) {
             Write-DecisionLine ("Inside startup grace window ({0:N1} < {1} minutes). Skipping full remediation to avoid transient startup churn." -f $uptime.TotalMinutes, $StartupGraceMinutes)
             $FinalServiceStatus = "$($svc.Status)"
-            goto Done
+            break
         }
     } catch {
         Write-WarnLine "Could not calculate uptime for startup grace evaluation: $($_.Exception.Message)"
@@ -649,7 +654,7 @@ try {
 if ($svc -and $svc.Status -eq 'Running') {
     Write-DecisionLine "$ServiceName recovered to Running after start timeout/event review. Skipping full remediation."
     $FinalServiceStatus = "Running"
-    goto Done
+    break
 }
 
 Write-DecisionLine "Both conditions met (service not Running + failure event detected). Proceeding with FULL REMEDIATION."
@@ -665,7 +670,7 @@ if (-not $siteUid) {
     Write-ErrorLine "Unable to read valid siteUID from $SettingsJsonPath."
     Write-DecisionLine "Aborting full remediation before any destructive change."
     $FinalServiceStatus = "$($svc.Status)"
-    goto Done
+    break
 } else {
     Write-LogLine "Using siteUID (UUID folder): $siteUid"
 }
@@ -697,7 +702,7 @@ try {
 } catch {
     Write-ErrorLine "Preflight download failed. Aborting before service/file changes: $($_.Exception.Message)"
     $FinalServiceStatus = "$($svc.Status)"
-    goto Done
+    break
 }
 
 try {
@@ -779,7 +784,7 @@ Invoke-LambdaUpload -Mode "remediation" -DomainName $DomainName -DeviceName $Dev
 # =========================
 # Done
 # =========================
-:Done
+} while ($false)
 if ($ActionTaken -eq "none" -and $UploadOnNoAction) {
     $siteUid = Get-SiteUid
     if (-not $siteUid) {
